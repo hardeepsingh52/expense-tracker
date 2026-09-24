@@ -16,21 +16,24 @@ from openai import OpenAI
 import json
 import os
 
-#client = OpenAI(
- #   base_url="https://integrate.api.nvidia.com/v1",
- #   api_key=os.environ["NVIDIA_API_KEY"]
-#)
-
 client = OpenAI(
+   base_url="https://integrate.api.nvidia.com/v1",
+   api_key=os.environ["NVIDIA_API_KEY"]
+)
+
+""" Super (balanced)	              nvidia/nemotron-3-super-120b-a12b
+    Ultra (largest, most capable)	  nvidia/nemotron-3-ultra-550b-a55b """
+
+""" client = OpenAI(
     base_url="https://api.groq.com/openai/v1/",
     api_key=os.environ["GROQ_API_KEY"]
-)
+) """
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 # --- Database setup ---
-DATABASE_URL = "sqlite:///./expenses.db"
+DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL)
 
 # --- JWT settings ---
@@ -210,11 +213,17 @@ def update_expense(expense_id: int, expense_update: ExpenseCreate, current_user:
         return expense
 
 
-def get_expenses_summary(user_id: int, category: Optional [str] = None) -> str:
+def get_expenses_summary(user_id: int, category: Optional [str] = None, date_range: Optional[str] = None) -> str:
     with Session(engine) as session:
         query = select(Expense).where(Expense.user_id == user_id)
         if category:
             query = query.where(Expense.category == category)
+        start, end = parse_date_range(date_range)
+        if start:
+            query = query.where(Expense.date >= start)
+        if end:
+            query = query.where(Expense.date <= end)
+
         expenses = session.exec(query).all()
         if not expenses:
            return "No expense found"
@@ -228,13 +237,18 @@ expense_tools = [
         "type": "function",
         "function": {
             "name": "get_expenses_summary",
-            "description": "Get a summary of the user's expenses, optionally filtered by category",
+            "description": "Get a summary of the user's expenses, optionally filtered by category and date range.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
-                        "type": "string",
-                        "description": "Optional category to filter by, e.g. 'Food', 'Transport'"
+    "type": ["string", "null"],
+    "enum": ["Food", "Transport", "Bills", "Entertainment", "Shopping", "Health", "Rent", "Travel", "Education", "Miscellaneous", None],
+    "description": "Optional category to filter by. Must be one of the listed categories — e.g. clothing purchases fall under 'Shopping'."
+},
+                    "date_range": {
+                        "type": ["string", "null"],
+                        "description": "Optional date range to filter by, e.g. '2023-01-01 to 2023-01-31', 'last month', 'this year'"
                     }
                 },
                 "required": []
@@ -245,6 +259,7 @@ expense_tools = [
 
 @app.post("/ask")
 def ask_about_expenses(question: dict, current_user: User = Depends(get_current_user)):
+  
     user_question = question["question"]
 
     messages = [
@@ -252,35 +267,70 @@ def ask_about_expenses(question: dict, current_user: User = Depends(get_current_
     ]
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="nvidia/nemotron-3-super-120b-a12b",
         messages=messages,
         tools=expense_tools,
         max_tokens=1000
     )
-
+   
     reply = response.choices[0].message
-
+   
     if reply.tool_calls:
         tool_call = reply.tool_calls[0]
         arguments = json.loads(tool_call.function.arguments)
 
         # We control user_id ourselves — never trust the model to supply it
-        result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"))
-
+        result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
+   
         messages.append(reply)
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
             "content": result
         })
-
+       
         final_response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model="nvidia/nemotron-3-super-120b-a12b",
             messages=messages,
             tools=expense_tools,
             max_tokens=1000
         )
-
+      
         return {"answer": final_response.choices[0].message.content}
 
     return {"answer": reply.content}
+
+
+
+
+
+def parse_date_range(date_range: Optional[str]):
+    if not date_range:
+        return None, None
+
+    now = utc_now()
+    text = date_range.strip().lower()
+
+    if text == "this month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, now
+    if text == "last month":
+        first_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_month_end = first_this_month - timedelta(seconds=1)
+        start = last_month_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, last_month_end
+    if text == "this year":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, now
+    if text == "last year":
+        start = now.replace(year=now.year - 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(year=now.year - 1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+        return start, end
+    if " to " in text:
+        start_str, end_str = text.split(" to ")
+        start = datetime.fromisoformat(start_str.strip()).replace(tzinfo=timezone.utc)
+        end = datetime.fromisoformat(end_str.strip()).replace(tzinfo=timezone.utc)
+        return start, end
+
+    return None, None
+

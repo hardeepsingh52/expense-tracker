@@ -1,0 +1,8 @@
+{
+  "name": "FastAPI: main.py",
+  "type": "debugpy",
+  "request": "launch",
+  "module": "uvicorn",
+  "args": ["main:app", "--reload"],
+  "cwd": "${workspaceFolder}/backend"
+}
