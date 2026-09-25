@@ -114,11 +114,11 @@ expense_tools = [
             }
         }
     },
-    {
+        {
         "type": "function",
         "function": {
             "name": "ask_clarifying_question",
-            "description": "Ask the user a clarifying question with a small set of concrete options to choose from, when their request doesn't give enough information for get_expenses_summary to run (e.g. an unrecognized or missing time period).",
+            "description": "Ask the user a clarifying question with exactly two concrete options to choose from, when their request doesn't give enough information for get_expenses_summary to run (e.g. an unrecognized or missing time period).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -126,20 +126,21 @@ expense_tools = [
                         "type": "string",
                         "description": "The clarifying question to show the user, e.g. 'Which time period would you like?'"
                     },
-                    "options": {
-                        "type": "array",
-                        "description": "2-3 concrete options the user can tap to answer. Exactly one should have recommended set to true.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {"type": "string", "description": "The option text shown to the user, e.g. 'This week'"},
-                                "recommended": {"type": "boolean", "description": "Whether this is the recommended option"}
-                            },
-                            "required": ["label", "recommended"]
-                        }
+                    "option_1": {
+                        "type": "string",
+                        "description": "The first option's label, e.g. 'This week'"
+                    },
+                    "option_2": {
+                        "type": "string",
+                        "description": "The second option's label, e.g. 'This month'"
+                    },
+                    "recommended_option": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": "Which option (1 or 2) is the recommended one"
                     }
                 },
-                "required": ["question", "options"]
+                "required": ["question", "option_1", "option_2", "recommended_option"]
             }
         }
     }
@@ -212,9 +213,13 @@ def ask_about_expenses(question: dict, current_user: User = Depends(get_current_
                 arguments = json.loads(tool_call.function.arguments)
 
                 if tool_call.function.name == "ask_clarifying_question":
+                    recommended = arguments.get("recommended_option")
                     clarifying_result = {
                         "answer": arguments.get("question"),
-                        "options": arguments.get("options", []),
+                        "options": [
+                            {"label": arguments.get("option_1"), "recommended": recommended == 1},
+                            {"label": arguments.get("option_2"), "recommended": recommended == 2},
+                        ],
                     }
                     tool_result = "Waiting for the user's choice."
                 else:
