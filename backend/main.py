@@ -269,55 +269,99 @@ expense_tools = [
         }
     }
 ]
-
 @app.post("/ask")
 def ask_about_expenses(question: dict, current_user: User = Depends(get_current_user)):
-  
+
     user_question = question["question"]
+    conversation_id = question.get("conversation_id")
+
     SYSTEM_PROMPT = """You are an expense-tracking assistant. Answer directly and concisely using only tool results — never narrate your reasoning process in the answer. Always be polite and respectful in tone — use warm, courteous language (e.g. "Could you let me know...", "I'd be happy to help with...") rather than blunt or robotic phrasing, while staying concise.
 
-Valid expense categories are: Food, Transport, Bills, Entertainment, Shopping, Health, Rent, Travel, Education, Miscellaneous.
-    Recognized time periods (only pass these to the tool): "this month", "last month", "this year", "last year", or an explicit "YYYY-MM-DD to YYYY-MM-DD" range.
-    
+    Valid expense categories are: Food, Transport, Bills, Entertainment, Shopping, Health, Rent, Travel, Education, Miscellaneous.
+    Recognized time periods (only pass these to the tool): "this week", "last week", "this month", "last month", "this year", "last year", or an explicit "YYYY-MM-DD to YYYY-MM-DD" range.
+
+    If there is more than one thing to clarify, ask about ONLY ONE at a time — never combine multiple clarifying questions into a single message.
+
     Step 1 — check the time period first. If the question doesn't specify one of the recognized time periods above:
     - Do NOT call the tool.
-    - Ask the user which time period they mean, offering exactly two concrete options (e.g. "This month" and "This year"), marking one "Recommended".
-    - If the category is also not an exact match to the valid list, mention that too in the same message (e.g. "Also note: 'electronics' isn't an exact category — closest matches are Shopping or Miscellaneous") so the user can clarify both at once.
+    - Ask the user which time period they mean, offering exactly two concrete options (e.g. "This week" and "This month"), marking one "Recommended", and mention they can also give their own custom range instead (e.g. "or tell me a specific date range like 2024-01-01 to 2024-03-31").
+    - Do NOT mention the category ambiguity in this message, even if the category is also unclear — that will be asked in a separate follow-up once the time period is known.
     - Stop here. Do not guess or call the tool until the user replies.
+
+    Step 2 — this step ONLY applies if the user explicitly mentioned a specific category-like word that does NOT match the valid list above (e.g. "electronics", "groceries", "clothes"). If the user simply did not mention any category at all, that is NOT ambiguous — it means "all categories combined." In that case, skip straight to Step 3.
+    - If a mismatched category word was used: briefly say the exact category doesn't exist, offer exactly two concrete category options marking one "Recommended", call the tool with the recommended category and the given time period, and give that number immediately — don't wait for confirmation. Mention the user can ask about the other option if it fits better.
+
+    Step 3 — if the time period is clear and there is no category ambiguity (either a valid category was given, or none was given at all): call the tool and give a direct, concise answer with no extra commentary."""
     
-    Step 2 — if the time period is clear, but the category doesn't map to an exact category from the list above:
-    - Briefly say the exact category doesn't exist.
-    - Offer exactly two concrete category options, marking one "Recommended".
-    - Call the tool using the recommended category and the given time period, and give that number immediately — don't wait for confirmation.
-    - Mention the user can ask about the other option if it fits better.
-    
-    Step 3 — if both the category and time period are clear: call the tool and give a direct, concise answer with no extra commentary."""
-    
-    messages = [
-    {"role": "system", "content": SYSTEM_PROMPT},
-    {"role": "user", "content": user_question}
-    ]
+    with Session(engine) as session:
+        if conversation_id:
+            conversation = session.get(Conversation, conversation_id)
+            if not conversation or conversation.user_id != current_user.id:
+                raise HTTPException(status_code=404, detail="Conversation not found")
 
-    for _ in range(4):
-        response = client.chat.completions.create(
-            model="nvidia/nemotron-3-super-120b-a12b", 
-            messages=messages, 
-            tools=expense_tools, 
-            max_tokens=1000
-        )
-   
-        reply = response.choices[0].message
-        messages.append(reply)
+            rows = session.exec(
+                select(ConversationMessage)
+                .where(ConversationMessage.conversation_id == conversation_id)
+                .order_by(ConversationMessage.id)
+            ).all()
 
-        if not reply.tool_calls:
-            return {"answer": reply.content}
+            messages = []
+            for row in rows:
+                if row.role == "assistant" and row.tool_calls_json:
+                    messages.append({"role": "assistant", "content": row.content, "tool_calls": json.loads(row.tool_calls_json)})
+                elif row.role == "tool":
+                    messages.append({"role": "tool", "tool_call_id": row.tool_call_id, "content": row.content})
+                else:
+                    messages.append({"role": row.role, "content": row.content})
+        else:
+            conversation = Conversation(user_id=current_user.id)
+            session.add(conversation)
+            session.commit()
+            session.refresh(conversation)
 
-        for tool_call in reply.tool_calls:
-            arguments = json.loads(tool_call.function.arguments)
-            result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            session.add(ConversationMessage(conversation_id=conversation.id, role="system", content=SYSTEM_PROMPT))
 
-    return {"answer": None}   # fallback if it never finishes in 4 rounds
+        messages.append({"role": "user", "content": user_question})
+        session.add(ConversationMessage(conversation_id=conversation.id, role="user", content=user_question))
+        session.commit()
+
+        for _ in range(4):
+            response = client.chat.completions.create(
+                model="nvidia/nemotron-3-super-120b-a12b",
+                messages=messages,
+                tools=expense_tools,
+                max_tokens=1000
+            )
+
+            reply = response.choices[0].message
+            messages.append(reply)
+
+            tool_calls_json = json.dumps([tc.model_dump() for tc in reply.tool_calls]) if reply.tool_calls else None
+            session.add(ConversationMessage(
+                conversation_id=conversation.id,
+                role="assistant",
+                content=reply.content or "",
+                tool_calls_json=tool_calls_json
+            ))
+            session.commit()
+
+            if not reply.tool_calls:
+                return {"answer": reply.content, "conversation_id": conversation.id}
+
+            for tool_call in reply.tool_calls:
+                arguments = json.loads(tool_call.function.arguments)
+                result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+                session.add(ConversationMessage(
+                    conversation_id=conversation.id,
+                    role="tool",
+                    content=result,
+                    tool_call_id=tool_call.id
+                ))
+            session.commit()
+
+        return {"answer": None, "conversation_id": conversation.id}
 
 
 
@@ -330,6 +374,14 @@ def parse_date_range(date_range: Optional[str]):
     now = utc_now()
     text = date_range.strip().lower()
 
+    if text == "this week":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        return start, now
+    if text == "last week":
+        this_week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        last_week_end = this_week_start - timedelta(seconds=1)
+        last_week_start = (last_week_end - timedelta(days=last_week_end.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        return last_week_start, last_week_end
     if text == "this month":
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return start, now

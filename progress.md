@@ -52,7 +52,12 @@ Claude will only describe changes (here or in chat) — Hardeep applies all code
 4. Remove leftover `DEBUG print(...)` statements added during troubleshooting.
 5. Consider raising `max_tokens` (currently 1000 on both completion calls) since the reasoning model spends tokens on `reasoning_content` before final `content`.
 6. ~~Fix reasoning-dump-in-answer issue for ambiguous/non-existent category questions~~ — done via `SYSTEM_PROMPT`, tested 2026-09-24.
-7. Persist conversation history per user/session so `/ask` supports true multi-turn follow-up (e.g. answering "yes" to a recommended option) instead of rebuilding `messages` fresh every call.
-   - Added `Conversation` and `ConversationMessage` SQLModel tables (`backend/main.py`) — confirmed auto-created in Neon Postgres via `create_tables()`. Applied by Hardeep.
-   - `/ask` endpoint itself is **not yet updated** to read/write these tables — still rebuilds `messages` from scratch every call, `conversation_id` is not accepted or returned yet. Proposed full rewrite (load history if `conversation_id` given, else create new `Conversation`, persist every turn, return `conversation_id` in response) discussed but not applied — next step.
-8. Once #7's `/ask` rewrite lands: update `SYSTEM_PROMPT` to ask clarifying questions one at a time (time period first, category only after the user answers) instead of combining both into a single message — this only makes sense once real conversation history exists.
+7. ~~Persist conversation history per user/session~~ — done. `Conversation`/`ConversationMessage` tables added, `/ask` rewritten to load history when `conversation_id` is passed (else creates a new conversation), persists every turn, and returns `conversation_id` in the response. Applied by Hardeep, tested 2026-09-24.
+8. ~~Ask clarifying questions one at a time~~ — done via updated `SYSTEM_PROMPT` (time period first, category only if it's an explicit mismatch, no-category-mentioned is treated as "all categories" not ambiguous).
+9. Fixed a data-loss bug in `SYSTEM_PROMPT`: 6 lines had lost their leading character/bullet dash ("alid expense categories", "tep 1", etc., missing "- " bullets) — likely an editor paste glitch. Restored text and, since already editing, also added "this week"/"last week" support (both `SYSTEM_PROMPT`'s recognized list and matching cases in `parse_date_range()` — Monday-start week boundaries via `now.weekday()`). This edit was made directly by Claude as an explicit one-time exception to the no-code-edit rule, per Hardeep's direct instruction ("fix it now then push").
+- Tested and confirmed working: no-time/no-category question asks cleanly with week+month options and mentions custom range; "this week" → real total; "last week" → correctly reports no expenses instead of erroring; "food this year" regression check unaffected; `conversation_id` now returned and incrementing across calls.
+
+## Open items / next up
+- Remove leftover `DEBUG print(...)` statements added during troubleshooting.
+- Consider raising `max_tokens` (currently 1000 on both completion calls) since the reasoning model spends tokens on `reasoning_content` before final `content`.
+- Frontend still doesn't exist — `/ask` now returns `conversation_id`, ready for a real chat UI to pass it back on follow-up questions.
