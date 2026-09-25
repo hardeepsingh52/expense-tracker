@@ -76,6 +76,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+class Conversation(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=utc_now)
+
+class ConversationMessage(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    conversation_id: int = Field(foreign_key="conversation.id")
+    role: str          # "system" | "user" | "assistant" | "tool"
+    content: str
+    tool_call_id: Optional[str] = Field(default=None)   # only set for role="tool"
+    tool_calls_json: Optional[str] = Field(default=None) # only set for role="assistant" when it made tool calls
+    created_at: datetime = Field(default_factory=utc_now)
 
 @app.post("/signup")
 def create_user(user: UserLogin):
@@ -242,9 +255,9 @@ expense_tools = [
                 "type": "object",
                 "properties": {
                     "category": {
-    "type": ["string", "null"],
-    "enum": ["Food", "Transport", "Bills", "Entertainment", "Shopping", "Health", "Rent", "Travel", "Education", "Miscellaneous", None],
-    "description": "Optional category to filter by. Must be one of the listed categories — e.g. clothing purchases fall under 'Shopping'."
+                        "type": ["string", "null"],
+                        "enum": ["Food", "Transport", "Bills", "Entertainment", "Shopping", "Health", "Rent", "Travel", "Education", "Miscellaneous", None],
+                        "description": "Optional category to filter by. Must be one of the listed categories — e.g. clothing purchases fall under 'Shopping'."
 },
                     "date_range": {
                         "type": ["string", "null"],
@@ -261,44 +274,50 @@ expense_tools = [
 def ask_about_expenses(question: dict, current_user: User = Depends(get_current_user)):
   
     user_question = question["question"]
+    SYSTEM_PROMPT = """You are an expense-tracking assistant. Answer directly and concisely using only tool results — never narrate your reasoning process in the answer. Always be polite and respectful in tone — use warm, courteous language (e.g. "Could you let me know...", "I'd be happy to help with...") rather than blunt or robotic phrasing, while staying concise.
 
+Valid expense categories are: Food, Transport, Bills, Entertainment, Shopping, Health, Rent, Travel, Education, Miscellaneous.
+    Recognized time periods (only pass these to the tool): "this month", "last month", "this year", "last year", or an explicit "YYYY-MM-DD to YYYY-MM-DD" range.
+    
+    Step 1 — check the time period first. If the question doesn't specify one of the recognized time periods above:
+    - Do NOT call the tool.
+    - Ask the user which time period they mean, offering exactly two concrete options (e.g. "This month" and "This year"), marking one "Recommended".
+    - If the category is also not an exact match to the valid list, mention that too in the same message (e.g. "Also note: 'electronics' isn't an exact category — closest matches are Shopping or Miscellaneous") so the user can clarify both at once.
+    - Stop here. Do not guess or call the tool until the user replies.
+    
+    Step 2 — if the time period is clear, but the category doesn't map to an exact category from the list above:
+    - Briefly say the exact category doesn't exist.
+    - Offer exactly two concrete category options, marking one "Recommended".
+    - Call the tool using the recommended category and the given time period, and give that number immediately — don't wait for confirmation.
+    - Mention the user can ask about the other option if it fits better.
+    
+    Step 3 — if both the category and time period are clear: call the tool and give a direct, concise answer with no extra commentary."""
+    
     messages = [
-        {"role": "user", "content": user_question}
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": user_question}
     ]
 
-    response = client.chat.completions.create(
-        model="nvidia/nemotron-3-super-120b-a12b",
-        messages=messages,
-        tools=expense_tools,
-        max_tokens=1000
-    )
-   
-    reply = response.choices[0].message
-   
-    if reply.tool_calls:
-        tool_call = reply.tool_calls[0]
-        arguments = json.loads(tool_call.function.arguments)
-
-        # We control user_id ourselves — never trust the model to supply it
-        result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
-   
-        messages.append(reply)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": result
-        })
-       
-        final_response = client.chat.completions.create(
-            model="nvidia/nemotron-3-super-120b-a12b",
-            messages=messages,
-            tools=expense_tools,
+    for _ in range(4):
+        response = client.chat.completions.create(
+            model="nvidia/nemotron-3-super-120b-a12b", 
+            messages=messages, 
+            tools=expense_tools, 
             max_tokens=1000
         )
-      
-        return {"answer": final_response.choices[0].message.content}
+   
+        reply = response.choices[0].message
+        messages.append(reply)
 
-    return {"answer": reply.content}
+        if not reply.tool_calls:
+            return {"answer": reply.content}
+
+        for tool_call in reply.tool_calls:
+            arguments = json.loads(tool_call.function.arguments)
+            result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+
+    return {"answer": None}   # fallback if it never finishes in 4 rounds
 
 
 
