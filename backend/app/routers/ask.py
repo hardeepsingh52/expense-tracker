@@ -21,10 +21,10 @@ SYSTEM_PROMPT = """You are an expense-tracking assistant. Answer directly and co
     If there is more than one thing to clarify, ask about ONLY ONE at a time — never combine multiple clarifying questions into a single message.
 
     Step 1 — check the time period first. If the question doesn't specify one of the recognized time periods above:
-    - Do NOT call the tool.
-    - Ask the user which time period they mean, offering exactly two concrete options (e.g. "This week" and "This month"), marking one "Recommended", and mention they can also give their own custom range instead (e.g. "or tell me a specific date range like 2024-01-01 to 2024-03-31").
+    - Do NOT call get_expenses_summary.
+    - Instead, call the ask_clarifying_question tool with a short question string and exactly two concrete options (e.g. "This week" and "This month"), marking exactly one option's "recommended" field true. Mention in the question text that the user can also give their own custom range instead (e.g. "or tell me a specific date range like 2024-01-01 to 2024-03-31").
     - Do NOT mention the category ambiguity in this message, even if the category is also unclear — that will be asked in a separate follow-up once the time period is known.
-    - Stop here. Do not guess or call the tool until the user replies.
+    - Stop here. Do not guess or call get_expenses_summary until the user replies.
 
     Step 2 — this step ONLY applies if the user explicitly mentioned a specific category-like word that does NOT match the valid list above (e.g. "electronics", "groceries", "clothes"). If the user simply did not mention any category at all, that is NOT ambiguous — it means "all categories combined." In that case, skip straight to Step 3.
     - If a mismatched category word was used: briefly say the exact category doesn't exist, offer exactly two concrete category options marking one "Recommended", call the tool with the recommended category and the given time period, and give that number immediately — don't wait for confirmation. Mention the user can ask about the other option if it fits better.
@@ -113,6 +113,35 @@ expense_tools = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_clarifying_question",
+            "description": "Ask the user a clarifying question with a small set of concrete options to choose from, when their request doesn't give enough information for get_expenses_summary to run (e.g. an unrecognized or missing time period).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The clarifying question to show the user, e.g. 'Which time period would you like?'"
+                    },
+                    "options": {
+                        "type": "array",
+                        "description": "2-3 concrete options the user can tap to answer. Exactly one should have recommended set to true.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "The option text shown to the user, e.g. 'This week'"},
+                                "recommended": {"type": "boolean", "description": "Whether this is the recommended option"}
+                            },
+                            "required": ["label", "recommended"]
+                        }
+                    }
+                },
+                "required": ["question", "options"]
+            }
+        }
     }
 ]
 
@@ -178,16 +207,29 @@ def ask_about_expenses(question: dict, current_user: User = Depends(get_current_
             if not reply.tool_calls:
                 return {"answer": reply.content, "conversation_id": conversation.id}
 
+            clarifying_result = None
             for tool_call in reply.tool_calls:
                 arguments = json.loads(tool_call.function.arguments)
-                result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
-                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+
+                if tool_call.function.name == "ask_clarifying_question":
+                    clarifying_result = {
+                        "answer": arguments.get("question"),
+                        "options": arguments.get("options", []),
+                    }
+                    tool_result = "Waiting for the user's choice."
+                else:
+                    tool_result = get_expenses_summary(user_id=current_user.id, category=arguments.get("category"), date_range=arguments.get("date_range"))
+
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
                 session.add(ConversationMessage(
                     conversation_id=conversation.id,
                     role="tool",
-                    content=result,
+                    content=tool_result,
                     tool_call_id=tool_call.id
                 ))
             session.commit()
+
+            if clarifying_result:
+                return {**clarifying_result, "conversation_id": conversation.id}
 
         return {"answer": None, "conversation_id": conversation.id}
